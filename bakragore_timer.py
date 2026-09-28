@@ -3,6 +3,8 @@ import ctypes
 import time
 import winsound
 import os
+import sys
+import json
 
 TP_INTERVAL = 90
 STRIKE_INTERVAL = 12
@@ -46,6 +48,21 @@ def format_time(seconds):
 
 
 AUDIO_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "audio")
+
+
+def _app_dir():
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.argv[0]))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+CONFIG_PATH = os.path.join(_app_dir(), "config.json")
+DEFAULT_HOTKEY = {"vk": 0x77, "ctrl": True, "alt": False, "shift": False, "display": "Ctrl+F8"}
+MODIFIER_KEYSYMS = {
+    "Control_L", "Control_R", "Shift_L", "Shift_R", "Alt_L", "Alt_R",
+    "Meta_L", "Meta_R", "Super_L", "Super_R", "Win_L", "Win_R",
+    "Caps_Lock", "Num_Lock", "Scroll_Lock",
+}
 
 
 def falar_numero(n):
@@ -117,6 +134,10 @@ class OverlayApp:
         self.paused = False
         self.pause_start = 0.0
         self.icon_photo = None
+        self.hotkey = self._load_hotkey()
+        self.recording = False
+        self.hotkey_armed = True
+        self._hk_prev = False
 
         self._setup_window()
         self._load_icon()
@@ -124,6 +145,7 @@ class OverlayApp:
         self._auto_size()
         self._set_click_through(True)
         self.root.after(50, self._tick)
+        self.root.after(100, self._poll_hotkey)
 
     def _setup_window(self):
         self.root.title("Bakragore Timer")
@@ -319,9 +341,105 @@ class OverlayApp:
         self.reset_btn = TibiaButton(row2, "Resetar", self._reset_all, STONE_DARK, STONE_LIGHT, icon="🔄")
         self.reset_btn.pack(side="left", expand=True, fill="x", padx=(P(4), 0))
 
+        row3 = tk.Frame(footer, bg=STONE_BG)
+        row3.pack(fill="x", pady=(P(6), 0))
+
+        self.hotkey_btn = TibiaButton(
+            row3, f"Hotkey: {self.hotkey['display']}", self._record_hotkey, STONE_DARK, STONE_LIGHT, icon="⌨"
+        )
+        self.hotkey_btn.pack(fill="x")
+
     def _cycle_boss(self):
         self.boss_index = (self.boss_index + 1) % len(BOSSES)
         self.boss_label.config(text=BOSSES[self.boss_index])
+
+    def _load_hotkey(self):
+        try:
+            if os.path.exists(CONFIG_PATH):
+                with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                hk = data.get("hotkey")
+                if hk and hk.get("vk"):
+                    return hk
+        except Exception:
+            pass
+        return dict(DEFAULT_HOTKEY)
+
+    def _save_hotkey(self):
+        try:
+            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump({"hotkey": self.hotkey}, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def _record_hotkey(self):
+        if self.recording:
+            return
+        self.recording = True
+        self.hotkey_armed = False
+        self.hotkey_btn.text_label.config(text="Pressione a tecla...", fg=GOLD)
+        self.root.focus_force()
+        self.root.bind_all("<KeyPress>", self._on_record_key)
+
+    def _on_record_key(self, event):
+        if event.keysym == "Escape":
+            self.recording = False
+            self.hotkey_btn.text_label.config(text=f"Hotkey: {self.hotkey['display']}", fg=TEXT)
+            self.root.unbind_all("<KeyPress>")
+            return
+        if event.keysym in MODIFIER_KEYSYMS or event.keycode == 0:
+            return
+        ctrl = bool(event.state & 0x0004)
+        alt = bool(event.state & 0x0008)
+        shift = bool(event.state & 0x0001)
+        name = event.keysym
+        if len(name) == 1:
+            name = name.upper()
+        parts = []
+        if ctrl:
+            parts.append("Ctrl")
+        if alt:
+            parts.append("Alt")
+        if shift:
+            parts.append("Shift")
+        parts.append(name)
+        self.hotkey = {
+            "vk": int(event.keycode),
+            "ctrl": ctrl,
+            "alt": alt,
+            "shift": shift,
+            "display": "+".join(parts),
+        }
+        self.recording = False
+        self._save_hotkey()
+        self.hotkey_btn.text_label.config(text=f"Hotkey: {self.hotkey['display']}", fg=TEXT)
+        self.root.unbind_all("<KeyPress>")
+
+    def _poll_hotkey(self):
+        try:
+            hk = self.hotkey
+            user32 = ctypes.windll.user32
+            down_vk = bool(user32.GetAsyncKeyState(hk["vk"]) & 0x8000)
+            down_ctrl = bool(user32.GetAsyncKeyState(0x11) & 0x8000)
+            down_alt = bool(user32.GetAsyncKeyState(0x12) & 0x8000)
+            down_shift = bool(user32.GetAsyncKeyState(0x10) & 0x8000)
+            if not self.hotkey_armed:
+                if not (down_vk or down_ctrl or down_alt or down_shift):
+                    self.hotkey_armed = True
+                self._hk_prev = False
+            else:
+                combo = (
+                    down_vk
+                    and down_ctrl == hk["ctrl"]
+                    and down_alt == hk["alt"]
+                    and down_shift == hk["shift"]
+                )
+                if combo and not self._hk_prev and not self.recording:
+                    self._start_strike()
+                self._hk_prev = combo
+        except Exception:
+            pass
+        self.root.after(30, self._poll_hotkey)
 
     def _toggle_tp(self):
         if self.paused:
